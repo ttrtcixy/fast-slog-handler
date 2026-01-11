@@ -10,24 +10,24 @@ import (
 func (h *ColorizedHandler) buildLog(buf []byte, record slog.Record) []byte {
 	// Formatting: Time | Level | Message
 	// Time
-	buf = append(buf, h.colorOpts.TimeColor...)
+	buf = append(buf, h.colorOpts.TimeColor...) // color
 	buf = record.Time.AppendFormat(buf, time.TimeOnly)
-	buf = append(buf, reset...)
+	buf = append(buf, reset...) // color
 
 	buf = append(buf, " | "...)
 
 	// Level
-	levelColor := levelColor(record.Level)
-	buf = append(buf, levelColor...)
+	levelColor := levelColor(record.Level) // color
+	buf = append(buf, levelColor...)       // color
 	buf = append(buf, levelBytes(record.Level)...)
-	buf = append(buf, reset...)
+	buf = append(buf, reset...) // color
 
 	buf = append(buf, " | "...)
 
 	// Message
-	buf = append(buf, levelColor...)
+	buf = append(buf, levelColor...) // color
 	buf = append(buf, record.Message...)
-	buf = append(buf, reset...)
+	buf = append(buf, reset...) // color
 
 	// Append precomputed attributes (from WithAttrs)
 	if len(h.precomputed) > 0 {
@@ -76,7 +76,7 @@ func (h *ColorizedHandler) appendAttr(buf []byte, groupPrefix []byte, attr slog.
 	}
 
 	buf = append(buf, ' ')
-	buf = append(buf, h.colorOpts.KeyColor...)
+	buf = append(buf, h.colorOpts.KeyColor...) // color
 
 	if len(groupPrefix) > 0 {
 		buf = append(buf, groupPrefix...)
@@ -87,11 +87,11 @@ func (h *ColorizedHandler) appendAttr(buf []byte, groupPrefix []byte, attr slog.
 	}
 	buf = append(buf, attr.Key...)
 	buf = append(buf, '=')
-	buf = append(buf, reset...)
+	buf = append(buf, reset...) // color
 
-	buf = append(buf, h.colorOpts.ValueColor...)
+	buf = append(buf, h.colorOpts.ValueColor...) // color
 	buf = h.writeValue(buf, attr.Value)
-	buf = append(buf, reset...)
+	buf = append(buf, reset...) // color
 
 	return buf
 }
