@@ -1,6 +1,7 @@
 package logger
 
 import (
+	"context"
 	"log/slog"
 )
 
@@ -47,4 +48,25 @@ func levelBytes(level slog.Level) string {
 	default:
 		return LevelInfo
 	}
+}
+
+type loggerCtxKey struct {
+}
+
+var AttrsKey = loggerCtxKey{}
+
+// AppendAttrsToCtx add []slog.Attr to ctx with AttrsKey, if the ctx already contains arguments, add them to the existing ones.
+func AppendAttrsToCtx(ctx context.Context, attrs ...slog.Attr) context.Context {
+	if len(attrs) == 0 {
+		return ctx
+	}
+
+	val, ok := ctx.Value(AttrsKey).([]slog.Attr)
+	if ok { // If attrs in ctx.
+		if len(val) != 0 {
+			attrs = append(val[:len(val):len(val)], attrs...)
+		}
+	}
+
+	return context.WithValue(ctx, AttrsKey, attrs)
 }

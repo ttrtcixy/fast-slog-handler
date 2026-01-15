@@ -96,7 +96,7 @@ func (h *ColorizedHandler) appendAttr(buf []byte, groupPrefix []byte, attr slog.
 	return buf
 }
 
-func (h *ColorizedHandler) writeValue(buf []byte, value slog.Value) []byte {
+func (h *ColorizedHandler) writeValue(buf []byte, value slog.Value) []byte { // todo other type
 	switch value.Kind() {
 	case slog.KindString:
 		str := value.String()

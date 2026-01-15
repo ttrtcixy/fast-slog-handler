@@ -164,8 +164,9 @@ var (
 )
 
 // Close signals the flusher to stop, marks the handler as closed using an atomic flag and flush buffer.
-// Closes buffered output only
-func (h *ColorizedHandler) Close(_ context.Context) error { // todo close write to io.Writer, not only bufio.Writer
+// Closes buffered output only.
+func (h *ColorizedHandler) Close(_ context.Context) error {
+	// todo close write to io.Writer, not only bufio.Writer
 	// If buffering was never create.
 	if h.shared.bw == nil {
 		return ErrNothingToClose
@@ -190,10 +191,18 @@ func (h *ColorizedHandler) Enabled(_ context.Context, level slog.Level) bool {
 	return level >= h.level
 }
 
-func (h *ColorizedHandler) Handle(_ context.Context, record slog.Record) (err error) {
+func (h *ColorizedHandler) Handle(ctx context.Context, record slog.Record) (err error) {
 	if h.shared.closed.Load() {
 		return nil
 	}
+
+	// Check the ctx for slog.Args
+	if ctx != nil {
+		if val, ok := ctx.Value(AttrsKey).([]slog.Attr); ok {
+			record.AddAttrs(val...)
+		}
+	}
+
 	// Acquire a buffer from the pool to minimize garbage collection pressure.
 	pBuf := bufPool.Get().(*[]byte)
 	// Reset buffer length but keep capacity.
