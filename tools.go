@@ -56,7 +56,7 @@ type loggerCtxKey struct {
 var AttrsKey = loggerCtxKey{}
 
 // AppendAttrsToCtx add []slog.Attr to ctx with AttrsKey, if the ctx already contains arguments, add them to the existing ones.
-func AppendAttrsToCtx(ctx context.Context, attrs ...slog.Attr) context.Context {
+func (h *ColorizedHandler) AppendAttrsToCtx(ctx context.Context, attrs ...slog.Attr) context.Context {
 	if len(attrs) == 0 {
 		return ctx
 	}
