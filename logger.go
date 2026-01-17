@@ -52,9 +52,9 @@ var bufPool = sync.Pool{
 
 type Config struct {
 	// logger level
-	Level int `env:"LOG_LEVEL"`
+	Level int `env:"LOG_LEVEL,required,notEmpty"`
 	// start buffered output to minimize count of syscall, buff size - 4096
-	BufferedOutput bool `env:"LOG_BUFFERED"`
+	BufferedOutput bool `env:"LOG_BUFFERED,required,notEmpty"`
 }
 
 type colorOptions struct {
