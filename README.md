@@ -1,28 +1,23 @@
 [English](README.md) | [Русский](README.ru.md)
 
-# High-Performance Colorized Slog Handler
+# High-Performance Slog Handler
 
-A fast, zero-allocation-focused `slog.Handler` for Go. This library provides beautiful colorized text output, optional asynchronous buffering to reduce syscalls, and advanced features like context-based attribute injection.
+The library provides optimized handlers for the slog package. The main focus is on speed and ease of local development.
+* **Text Handler**: Created for local development. ANSI highlighting of levels, timestamps, and metadata. (Not recommended for production).
+* **JSON Handler**: High-performance handler for production environments.
 
-## ⚠️ Performance & Compatibility Note
-* **Target Use Case**: This handler is specifically designed for **local development**. Due to the overhead of ANSI color processing, it is approximately **3x slower** than a standard non-colorized handler.
-* **Production**: A high-performance **JSON version** (without color overhead) is planned for the next release.
-* **slog Compatibility**: Supports all standard `slog.Logger` features (groups, attributes, context) **except for `slog.LogValuer`** (coming soon).
+## Key Features
+* Using `sync.Pool` minimizes the load on GC and memory allocation in the heap.
+* Optional buffering via `bufio` with background data flushing to reduce latency on system calls.
+* Simple transfer of TraceID or RequestID directly via `context.Context`.
+* Full thread safety.
 
-## 🚀 Key Features
-* **Optimized Memory Management**: Uses a `sync.Pool` to minimize heap allocations.
-* **Asynchronous Buffering**: Optional `bufio` integration with a background flusher goroutine for high-throughput environments.
-* **Context-Aware Attributes**: Inject log attributes directly into `context.Context` (for Request IDs or Trace IDs).
-* **Smart Group Flattening**: Automatically flattens nested `slog.Group` attributes into clean dot-notation keys (e.g., `db.conn.id=5`).
-* **Thread-Safe & Graceful**: Atomic flags and mutex protection ensure safe operation and clean shutdowns.
-* **Colorized Output**: High-visibility ANSI colors for timestamps, log levels, and metadata.
-
-## 📦 Installation
+## Installation
 ```shell
 go get github.com/ttrtcixy/color-slog-handler
 ```
 
-## 🛠 Usage
+## Usage
 
 ```go
 package main
@@ -31,45 +26,44 @@ import (
 	"context"
 	"log/slog"
 	"os"
+
+	logger "github.com/ttrtcixy/color-slog-handler"
 )
 
 func main() {
-	cfg := &Config{
+	cfg := &logger.Config{
 		Level:          int(slog.LevelDebug),
-		BufferedOutput: true, // Enables background flushing
+		BufferedOutput: true, // Enables buffered output and background flushing.
 	}
 
-	handler := NewTextHandler(os.Stdout, cfg)
-	logger := slog.New(handler)
+	// Use logger.NewTextHandler(os.Stdout, cfg) for local development
+	handler := logger.NewJsonHandler(os.Stdout, cfg)
+	l := slog.New(handler)
 
-	// Important: Close the handler to stop the flusher and flush remaining logs
+	// Important: Close the handler to stop the background flusher and flush remaining logs.
 	defer handler.Close(context.Background())
 
-	logger.Info("User logged in", "user_id", 42, "status", "active")
+	l.LogAttrs(nil, slog.LevelInfo, "msg", slog.String("key", "val"))
+
+	// Inject attributes into the context
+	ctx := handler.AppendAttrsToCtx(context.Background(), slog.String("trace_id", "af82-bx22"))
+
+	// The logger will automatically extract and include these attributes
+	l.LogAttrs(ctx, slog.LevelInfo, "msg")
 }
 ```
-Easily pass attributes through the context without modifying every function signature:
-```go
-// Add attributes to context
-ctx := AppendAttrsToCtx(context.Background(), slog.String("trace_id", "af82-bx22"))
 
-// The logger will automatically pick them up
-logger.InfoContext(ctx, "processing request")
-// Output: 14:05:01 | INFO | processing request trace_id=af82-bx22
-```
-
-## ⚙️ Configuration
+## Configuration
 The `Config` struct supports environment variables via tags:
 * `Level`: Logging level (e.g., Debug=-4, Info=0).
-* `BufferedOutput`: Enable/Disable 4KB buffer with periodic async flush.
+* `BufferedOutput`: Enable/Disable 4 KB buffer with automatic periodic flushing.
 
-## ⚠️ Important Note on Buffering
-If `BufferedOutput`: true is set, you must call `handler.Close(ctx)`:
-* It stops the background flusher goroutine.
-* It ensures any remaining logs in the 4096-byte buffer are written to the output.
+## Important Note on Buffering
+If `BufferedOutput` is set to: true, you must call `handler.Close(ctx)`:
+* It stops the background flushing goroutine.
+* It ensures that all remaining logs in the 4096-byte buffer are written to the output.
 
-Calling `Close()` on a non-buffered handler will return `ErrNothingToClose`.
+Calling `Close()` for an unbuffered handler will return `ErrNothingToClose`.
 
-## 🛣 Roadmap
-* JSON output support with same buffering logic.
-* Full `slog.LogValuer` support.
+## Roadmap
+* Support for `slog.LogValuer`.
