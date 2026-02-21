@@ -17,7 +17,7 @@ const (
 	// max size of pool buffer
 	maxPoolBufSize = 2048
 	// base size when creating a buffer for the pool
-	basePoolBufferSize = 512
+	basePoolBufferSize = 1024
 	// waiting time for the automatic Flush() call
 	flushTime = time.Millisecond * 250
 )
@@ -45,9 +45,9 @@ var bufPool = sync.Pool{
 
 type Config struct {
 	// logger level
-	Level int `env:"LOG_LEVEL,required,notEmpty"`
+	Level int
 	// start buffered output to minimize count of syscall, buff size - 4096
-	BufferedOutput bool `env:"LOG_BUFFERED,required,notEmpty"`
+	BufferedOutput bool
 }
 
 // shared contains resources that must be synchronized across all handler clones.
@@ -68,9 +68,6 @@ type shared struct {
 
 type builder interface {
 	buildLog(buf []byte, record slog.Record, precomputedAttrs string, groupPrefix string) []byte
-	appendAttr(buf []byte, groupPrefix []byte, attr slog.Attr) []byte
-	writeValue(buf []byte, value slog.Value) []byte
-
 	precomputeAttrs(buf []byte, groupPrefix string, attrs []slog.Attr) []byte
 	groupPrefix(oldPrefix string, newPrefix string) string
 }
@@ -216,7 +213,11 @@ func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	}
 
 	// Temporary buffer for parsing attributes.
-	buf := make([]byte, 0, 512)
+	buf := make(
+		[]byte,
+		0,
+		512,
+	) // typically the buffer is allocated on the stack as long as the attributes do not exceed 512 bytes
 
 	// Existing precomputed attributes must come first.
 	buf = append(buf, h.precomputed...)
@@ -238,6 +239,27 @@ func (h *Handler) clone() *Handler {
 		groupPrefix: h.groupPrefix,
 		precomputed: h.precomputed,
 	}
+}
+
+type loggerCtxKey struct {
+}
+
+var AttrsKey = loggerCtxKey{}
+
+// AppendAttrsToCtx add []slog.Attr to ctx with AttrsKey, if the ctx already contains arguments, add them to the existing ones.
+func (h *Handler) AppendAttrsToCtx(ctx context.Context, attrs ...slog.Attr) context.Context {
+	if len(attrs) == 0 {
+		return ctx
+	}
+
+	val, ok := ctx.Value(AttrsKey).([]slog.Attr)
+	if ok { // If attrs in ctx.
+		if len(val) != 0 {
+			attrs = append(val[:len(val):len(val)], attrs...)
+		}
+	}
+
+	return context.WithValue(ctx, AttrsKey, attrs)
 }
 
 //func (h *ColorizedHandler) WithGroup(name string) slog.handler {

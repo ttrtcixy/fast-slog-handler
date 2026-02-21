@@ -8,35 +8,32 @@ import (
 	"os"
 	"strconv"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
-var (
-	reset   = []byte("\033[0m")
-	red     = []byte("\033[31m")
-	green   = []byte("\033[32m")
-	yellow  = []byte("\033[33m")
-	blue    = []byte("\033[34m")
-	magenta = []byte("\033[35m")
-	cyan    = []byte("\033[36m")
-	none    = []byte("")
+//var (
+//	reset   = []byte("\033[0m")
+//	red     = []byte("\033[31m")
+//	green   = []byte("\033[32m")
+//	yellow  = []byte("\033[33m")
+//	blue    = []byte("\033[34m")
+//	magenta = []byte("\033[35m")
+//	cyan    = []byte("\033[36m")
+//	none    = []byte("")
+//)
+
+const (
+	reset  = "\u001b[0m"
+	faint  = "\u001b[2m"
+	red    = "\u001b[91m"
+	green  = "\u001b[92m"
+	yellow = "\u001b[93m"
+	blue   = "\u001b[94m"
 )
-
-type colorOptions struct {
-	TimeColor  []byte
-	KeyColor   []byte
-	ValueColor []byte
-}
-
-func newColorOptions(timeColor, keyColor, valueColor []byte) *colorOptions {
-	return &colorOptions{
-		TimeColor:  timeColor,
-		KeyColor:   keyColor,
-		ValueColor: valueColor,
-	}
-}
 
 type colorizedTextBuilder struct {
-	colorOpts *colorOptions
+	//colorOpts *colorOptions
 }
 
 func NewTextHandler(w io.Writer, cfg *Config) *Handler {
@@ -49,7 +46,7 @@ func NewTextHandler(w io.Writer, cfg *Config) *Handler {
 	}
 
 	textBuilder := &colorizedTextBuilder{
-		colorOpts: newColorOptions(blue, magenta, none),
+		//colorOpts: newColorOptions(faint, faint),
 	}
 
 	handler := newHandler(w, slog.Level(cfg.Level), textBuilder)
@@ -64,25 +61,26 @@ func NewTextHandler(w io.Writer, cfg *Config) *Handler {
 	return handler
 }
 
-func (b *colorizedTextBuilder) buildLog(buf []byte, record slog.Record, precomputedAttrs string, groupPrefix string) []byte {
+func (b *colorizedTextBuilder) buildLog(
+	buf []byte,
+	record slog.Record,
+	precomputedAttrs string,
+	groupPrefix string,
+) []byte {
 	// Time
-	buf = append(buf, b.colorOpts.TimeColor...) // color
-	buf = record.Time.AppendFormat(buf, time.TimeOnly)
+	buf = append(buf, faint...) // color
+	buf = record.Time.AppendFormat(buf, time.Stamp)
 	buf = append(buf, reset...) // color
-	buf = append(buf, " | "...)
+	buf = append(buf, ' ')
 
 	// Level
-	levelColor := levelColor(record.Level)
-	buf = append(buf, levelColor...) // color
+	buf = append(buf, levelColor(record.Level)...) // color
 	buf = append(buf, levelBytes(record.Level)[:4]...)
 	buf = append(buf, reset...) // color
+	buf = append(buf, ' ')
 
-	buf = append(buf, " | "...)
-
-	// Message
-	buf = append(buf, levelColor...) // color
+	// Message // todo if no message
 	buf = append(buf, record.Message...)
-	buf = append(buf, reset...) // color
 
 	// Append precomputed attributes (from WithAttrs)
 	if len(precomputedAttrs) > 0 {
@@ -130,7 +128,7 @@ func (b *colorizedTextBuilder) appendAttr(buf []byte, groupPrefix []byte, attr s
 	}
 
 	buf = append(buf, ' ')
-	buf = append(buf, b.colorOpts.KeyColor...) // color
+	buf = append(buf, faint...) // color
 
 	if len(groupPrefix) > 0 {
 		buf = append(buf, groupPrefix...)
@@ -143,9 +141,7 @@ func (b *colorizedTextBuilder) appendAttr(buf []byte, groupPrefix []byte, attr s
 	buf = append(buf, '=')
 	buf = append(buf, reset...) // color
 
-	buf = append(buf, b.colorOpts.ValueColor...) // color
 	buf = b.writeValue(buf, attr.Value)
-	buf = append(buf, reset...) // color
 
 	return buf
 }
@@ -153,11 +149,7 @@ func (b *colorizedTextBuilder) appendAttr(buf []byte, groupPrefix []byte, attr s
 func (b *colorizedTextBuilder) writeValue(buf []byte, value slog.Value) []byte {
 	switch value.Kind() {
 	case slog.KindString:
-		str := value.String()
-		if str == "" {
-			str = "!EMPTY_VALUE"
-		}
-		buf = append(buf, str...)
+		buf = b.appendString(buf, value.String())
 	case slog.KindInt64:
 		buf = strconv.AppendInt(buf, value.Int64(), 10)
 	case slog.KindUint64:
@@ -175,10 +167,6 @@ func (b *colorizedTextBuilder) writeValue(buf []byte, value slog.Value) []byte {
 	case slog.KindTime:
 		buf = value.Time().AppendFormat(buf, time.DateTime)
 	case slog.KindAny:
-		//if err, ok := value.Any().(error); ok {
-		//	buf = append(buf, err.Error()...)
-		//	return buf
-		//}
 		b, err := json.Marshal(value.Any())
 		if err != nil {
 			buf = append(buf, "!ERR_MARSHAL"...)
@@ -210,4 +198,39 @@ func (b *colorizedTextBuilder) precomputeAttrs(buf []byte, groupPrefix string, a
 
 func (b *colorizedTextBuilder) groupPrefix(oldPrefix string, newPrefix string) string {
 	return oldPrefix + newPrefix + "."
+}
+
+func (b *colorizedTextBuilder) appendString(buf []byte, val string) []byte {
+	if val == "" {
+		buf = append(buf, "!EMPTY_VALUE"...)
+	} else {
+		if needsQuoting(val) {
+			buf = strconv.AppendQuote(buf, val)
+		} else {
+			buf = append(buf, val...)
+		}
+	}
+	return buf
+}
+
+func needsQuoting(s string) bool {
+	if len(s) == 0 {
+		return true
+	}
+	for i := 0; i < len(s); {
+		b := s[i]
+		if b < utf8.RuneSelf {
+			if b != '\\' && (b == ' ' || b == '=' || !safeSet[b]) {
+				return true
+			}
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError || unicode.IsSpace(r) || !unicode.IsPrint(r) {
+			return true
+		}
+		i += size
+	}
+	return false
 }
