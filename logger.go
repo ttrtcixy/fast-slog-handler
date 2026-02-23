@@ -6,6 +6,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,11 +17,16 @@ const (
 	// size of buffio.Writer
 	writerBufSize = 4096
 	// max size of pool buffer
-	maxPoolBufSize = 2048
+	maxPoolBufSize = 4096
 	// base size when creating a buffer for the pool
-	basePoolBufferSize = 1024
+	basePoolBufferSize = 2048
 	// waiting time for the automatic Flush() call
 	flushTime = time.Millisecond * 250
+)
+
+var (
+	poolBaseSize = basePoolBufferSize
+	poolMaxSize  = maxPoolBufSize
 )
 
 const (
@@ -38,16 +45,24 @@ var (
 var bufPool = sync.Pool{
 	New: func() any {
 		// Use a pointer to slice to avoid allocation when putting back to pool
-		b := make([]byte, 0, basePoolBufferSize)
+		b := make([]byte, 0, poolBaseSize)
 		return &b
 	},
 }
 
 type Config struct {
-	// logger level
-	Level int
-	// start buffered output to minimize count of syscall, buff size - 4096
+	// logger level, default - slog.LevelError
+	Level slog.Level
+	// start buffered output to minimize count of syscall.
 	BufferedOutput bool
+	// if BufferedOutput == true, you can specify the buffer size; if WriteBuffSize == 0, a buffer of size 4096 will be allocated.
+	WriteBuffSize int
+	// if BufferedOutput == true, you can specify the time after which the buffer will be cleared automatically, if FlushInterval == 0 clearing will occur every 250ms.
+	FlushInterval time.Duration
+	// buffer size stored in the pool, default - 2048.
+	BaseBufPoolSize int
+	// the maximum size to which the buffer in the pool can be expanded; after exceeding this size, the buffer is cleared by the garbage collector, default - 4096.
+	MaxBufPoolSize int
 }
 
 // shared contains resources that must be synchronized across all handler clones.
@@ -67,9 +82,9 @@ type shared struct {
 }
 
 type builder interface {
-	buildLog(buf []byte, record slog.Record, precomputedAttrs string, groupPrefix string) []byte
+	buildLog(buf []byte, record slog.Record, precomputed []byte, depth int) []byte
 	precomputeAttrs(buf []byte, groupPrefix string, attrs []slog.Attr) []byte
-	groupPrefix(oldPrefix string, newPrefix string) string
+	groupPrefix(oldPrefix []byte, newPrefix string) []byte
 }
 
 type Handler struct {
@@ -81,12 +96,14 @@ type Handler struct {
 	// builder implements the log formatting logic (text, json, etc.) abstracting it from the handler control flow.
 	builder builder
 
-	// groupPrefix stores the accumulated group name (e.g., "http.server.")
-	// to flatten nested groups into dot-notation keys.
-	groupPrefix string
-
-	// precomputed stores already formatted attributes from WithAttrs()
-	precomputed string
+	//// groupPrefix stores the accumulated group name (e.g., "http.server.")
+	//// to flatten nested groups into dot-notation keys.
+	//groupPrefix string
+	//
+	//// precomputed for jsonBuilder stores already formatted args from WithAttrs() and WithGroup()
+	//precomputed []byte
+	////
+	//depth int
 }
 
 // Close signals the flusher to stop, marks the handler as closed using an atomic flag and flush buffer.
@@ -111,8 +128,16 @@ func (h *Handler) Close(_ context.Context) error {
 
 // flusher periodically flushes the buffer to the writer.
 // It stops when the done channel is closed.
-func (h *Handler) flusher() {
-	ticker := time.NewTicker(flushTime)
+func (h *Handler) flusher(cfgFlushInterval time.Duration) {
+	var ticker *time.Ticker
+
+	if cfgFlushInterval <= 0 {
+		ticker = time.NewTicker(cfgFlushInterval)
+	} else {
+		ticker = time.NewTicker(flushTime)
+
+	}
+
 	defer ticker.Stop()
 
 	for {
@@ -132,7 +157,15 @@ func (h *Handler) flushBuffer() {
 	h.shared.mu.Unlock()
 }
 
-func newHandler(w io.Writer, level slog.Level, builder builder) *Handler {
+func newHandler(w io.Writer, cfg *Config, builder builder) *Handler {
+	if w == nil {
+		w = os.Stderr
+	}
+
+	if cfg == nil {
+		cfg = &Config{Level: slog.LevelInfo, BufferedOutput: false}
+	}
+
 	shared := &shared{
 		mu:     &sync.Mutex{},
 		w:      w,
@@ -140,11 +173,32 @@ func newHandler(w io.Writer, level slog.Level, builder builder) *Handler {
 		closed: atomic.Bool{},
 	}
 
-	return &Handler{
+	handler := &Handler{
 		shared:  shared,
-		level:   level,
+		level:   cfg.Level,
 		builder: builder,
 	}
+
+	if cfg.BaseBufPoolSize > 0 {
+		poolBaseSize = cfg.BaseBufPoolSize
+	}
+
+	if cfg.MaxBufPoolSize > 0 {
+		poolMaxSize = cfg.MaxBufPoolSize
+	}
+
+	if cfg.BufferedOutput {
+		if cfg.WriteBuffSize > 0 {
+			handler.shared.bw = bufio.NewWriterSize(w, cfg.WriteBuffSize)
+		} else {
+			handler.shared.bw = bufio.NewWriterSize(w, writerBufSize)
+		}
+		// Start a background routine to periodically flush the buffer.
+		// This ensures logs appear even during low activity periods.
+		go handler.flusher(cfg.FlushInterval)
+	}
+
+	return handler
 }
 
 func (h *Handler) Enabled(_ context.Context, level slog.Level) bool {
@@ -161,7 +215,7 @@ func (h *Handler) Handle(ctx context.Context, record slog.Record) (err error) {
 
 	// Check the ctx for slog.Args
 	if ctx != nil {
-		if val, ok := ctx.Value(AttrsKey).([]slog.Attr); ok {
+		if val, ok := ctx.Value(attrsKey).([]slog.Attr); ok {
 			record.AddAttrs(val...)
 		}
 	}
@@ -171,7 +225,7 @@ func (h *Handler) Handle(ctx context.Context, record slog.Record) (err error) {
 	// Reset buffer length but keep capacity.
 	buf := (*pBuf)[:0]
 
-	buf = h.builder.buildLog(buf, record, h.precomputed, h.groupPrefix)
+	buf = h.builder.buildLog(buf, record, h.precomputed, h.depth)
 
 	if !h.shared.closed.Load() {
 		h.shared.mu.Lock()
@@ -185,7 +239,7 @@ func (h *Handler) Handle(ctx context.Context, record slog.Record) (err error) {
 
 	// Return buffer to pool only if it hasn't grown too large.
 	// This prevents one huge handler message from permanently keeping a large chunk of memory.
-	if cap(buf) <= maxPoolBufSize {
+	if cap(buf) <= poolMaxSize {
 		*pBuf = buf
 		bufPool.Put(pBuf)
 	}
@@ -201,7 +255,8 @@ func (h *Handler) WithGroup(name string) slog.Handler {
 
 	h2 := h.clone()
 
-	h2.groupPrefix = h2.builder.groupPrefix(h2.groupPrefix, name) // alloc
+	h2.precomputed = h2.builder.groupPrefix(h2.precomputed, name) // alloc
+	h2.depth++
 
 	return h2
 }
@@ -212,21 +267,10 @@ func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
 		return h
 	}
 
-	// Temporary buffer for parsing attributes.
-	buf := make(
-		[]byte,
-		0,
-		512,
-	) // typically the buffer is allocated on the stack as long as the attributes do not exceed 512 bytes
-
-	// Existing precomputed attributes must come first.
-	buf = append(buf, h.precomputed...)
-
-	buf = h.builder.precomputeAttrs(buf, h.groupPrefix, attrs)
-
 	h2 := h.clone()
 
-	h2.precomputed = string(buf)
+	h2.precomputed = h.builder.precomputeAttrs(h2.precomputed, h.groupPrefix, attrs)
+
 	return h2
 }
 
@@ -237,29 +281,31 @@ func (h *Handler) clone() *Handler {
 		level:       h.level,
 		builder:     h.builder,
 		groupPrefix: h.groupPrefix,
-		precomputed: h.precomputed,
+		precomputed: slices.Clip(h.precomputed),
+		depth:       h.depth,
 	}
 }
 
 type loggerCtxKey struct {
 }
 
-var AttrsKey = loggerCtxKey{}
+var attrsKey = loggerCtxKey{}
 
-// AppendAttrsToCtx add []slog.Attr to ctx with AttrsKey, if the ctx already contains arguments, add them to the existing ones.
+// AppendAttrsToCtx add []slog.Attr to ctx with attrsKey, if the ctx already contains arguments, add them to the existing ones.
+// Attributes will be added at the beginning, outside of groups created using WithGroup.
 func (h *Handler) AppendAttrsToCtx(ctx context.Context, attrs ...slog.Attr) context.Context {
 	if len(attrs) == 0 {
 		return ctx
 	}
 
-	val, ok := ctx.Value(AttrsKey).([]slog.Attr)
+	val, ok := ctx.Value(attrsKey).([]slog.Attr)
 	if ok { // If attrs in ctx.
 		if len(val) != 0 {
 			attrs = append(val[:len(val):len(val)], attrs...)
 		}
 	}
 
-	return context.WithValue(ctx, AttrsKey, attrs)
+	return context.WithValue(ctx, attrsKey, attrs)
 }
 
 //func (h *ColorizedHandler) WithGroup(name string) slog.handler {

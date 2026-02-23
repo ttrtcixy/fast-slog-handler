@@ -1,84 +1,57 @@
 package logger
 
 import (
-	"bufio"
 	"encoding/json"
 	"io"
 	"log/slog"
-	"os"
+	"slices"
 	"strconv"
 	"time"
 	"unicode/utf8"
 )
 
 type jsonBuilder struct {
+	// precomputed for jsonBuilder stores already formatted args from WithAttrs() and WithGroup()
+	precomputed []byte
+	//
+	depth int
 }
 
 func NewJsonHandler(w io.Writer, cfg *Config) *Handler {
-	if w == nil {
-		w = os.Stderr
-	}
-
-	if cfg == nil {
-		cfg = &Config{Level: 0, BufferedOutput: false}
-	}
-
-	handler := newHandler(w, slog.Level(cfg.Level), &jsonBuilder{})
-
-	if cfg.BufferedOutput {
-		handler.shared.bw = bufio.NewWriterSize(w, writerBufSize)
-		// Start a background routine to periodically flush the buffer.
-		// This ensures logs appear even during low activity periods.
-		go handler.flusher()
-	}
-
-	return handler
+	return newHandler(w, cfg, &jsonBuilder{})
 }
 
-func (b *jsonBuilder) buildLog(buf []byte, record slog.Record, precomputedAttrs string, groupPrefix string) []byte {
+func (b *jsonBuilder) buildLog(buf []byte, record slog.Record, precomputed []byte, depth int) []byte {
 	buf = append(buf, `{"time":"`...)
 	buf = record.Time.AppendFormat(buf, time.DateTime)
+
 	buf = append(buf, `","level":"`...)
 	buf = append(buf, levelBytes(record.Level)...)
-	buf = append(buf, `","msg":"`...) // todo if no message
-	buf = append(buf, record.Message...)
+
+	buf = append(buf, `","msg":"`...)
+	if record.Message == "" {
+		buf = append(buf, `!EMPTY_MESSAGE`...)
+	} else {
+		buf = append(
+			buf,
+			record.Message...) // dangerous because it does not track whether there are invalid JSON characters in the line
+	}
 	buf = append(buf, '"')
 
-	if record.NumAttrs() > 0 || precomputedAttrs != "" {
-		buf = append(buf, ',')
-		if groupPrefix != "" {
-			buf = append(buf, groupPrefix...)
-		}
+	if len(precomputed) > 0 {
+		buf = b.addComma(buf)
+		buf = append(buf, precomputed...)
+	}
 
-		if record.NumAttrs() > 0 {
+	if record.NumAttrs() > 0 {
+		record.Attrs(func(attr slog.Attr) bool {
+			buf = b.appendAttr(buf, attr)
+			return true
+		})
+	}
 
-			if precomputedAttrs != "" {
-				buf = append(buf, precomputedAttrs...)
-				buf = append(buf, ',')
-			}
-
-			var isFirst = true
-			record.Attrs(func(attr slog.Attr) bool {
-				//attr.Value = attr.Value.Resolve()
-				if attr.Equal(slog.Attr{}) {
-					return true
-				}
-
-				if !isFirst {
-					buf = append(buf, ',')
-				} else {
-					isFirst = false
-				}
-				buf = b.appendAttr(buf, nil, attr)
-				return true
-			})
-		} else {
-			buf = append(buf, precomputedAttrs...)
-		}
-
-		if groupPrefix != "" {
-			buf = append(buf, '}')
-		}
+	for range depth {
+		buf = append(buf, '}')
 	}
 
 	buf = append(buf, '}', '\n')
@@ -86,8 +59,8 @@ func (b *jsonBuilder) buildLog(buf []byte, record slog.Record, precomputedAttrs 
 	return buf
 }
 
-func (b *jsonBuilder) appendAttr(buf []byte, _ []byte, attr slog.Attr) []byte {
-	//attr.Value = attr.Value.Resolve()
+func (b *jsonBuilder) appendAttr(buf []byte, attr slog.Attr) []byte {
+	attr.Value = attr.Value.Resolve()
 
 	if attr.Equal(slog.Attr{}) {
 		return buf
@@ -97,31 +70,21 @@ func (b *jsonBuilder) appendAttr(buf []byte, _ []byte, attr slog.Attr) []byte {
 	if attr.Value.Kind() == slog.KindGroup {
 		group := attr.Value.Group()
 
-		// If no attrs in group - slog.Group("group",).
+		// If no attrs in group - slog.Group("group").
 		if len(group) == 0 {
 			return buf
 		}
 
 		if attr.Key != "" {
+			buf = b.addComma(buf)
 			buf = append(buf, '"')
 			//buf = append(buf, attr.Key...)
 			buf = appendEscapedJSONString(buf, attr.Key)
 			buf = append(buf, `":{`...)
 		}
 
-		var isFirst = true
 		for _, v := range group {
-			if v.Equal(slog.Attr{}) {
-				continue
-			}
-
-			if !isFirst {
-				buf = append(buf, ',')
-			} else {
-				isFirst = false
-			}
-
-			buf = b.appendAttr(buf, nil, v)
+			buf = b.appendAttr(buf, v)
 		}
 
 		if attr.Key != "" {
@@ -131,13 +94,14 @@ func (b *jsonBuilder) appendAttr(buf []byte, _ []byte, attr slog.Attr) []byte {
 		return buf
 	}
 
+	buf = b.addComma(buf)
+
 	// Write key.
 	buf = append(buf, '"')
 	if attr.Key == "" {
-		buf = append(buf, "!EMPTY_KEY"...)
+		buf = append(buf, `!EMPTY_KEY`...)
 	} else {
 		buf = appendEscapedJSONString(buf, attr.Key)
-
 	}
 	buf = append(buf, `":`...)
 
@@ -167,21 +131,21 @@ func (b *jsonBuilder) writeValue(buf []byte, value slog.Value) []byte {
 		buf = strconv.AppendInt(buf, value.Duration().Nanoseconds(), 10)
 	case slog.KindTime:
 		buf = append(buf, '"')
-		buf = value.Time().AppendFormat(buf, time.DateTime)
+		buf = value.Time().AppendFormat(buf, time.RFC3339Nano)
 		buf = append(buf, '"')
 	case slog.KindAny:
 		if err, ok := value.Any().(error); ok {
-			buf = append(buf, err.Error()...)
+			buf = b.appendString(buf, err.Error())
 			return buf
 		}
 		b, err := json.Marshal(value.Any())
 		if err != nil {
-			buf = append(buf, "!ERR_MARSHAL"...)
+			buf = append(buf, `!ERR_MARSHAL`...)
 		} else {
 			buf = append(buf, b...)
 		}
 	default:
-		buf = append(buf, "!UNHANDLED"...)
+		buf = append(buf, `!UNHANDLED`...)
 	}
 
 	return buf
@@ -190,7 +154,7 @@ func (b *jsonBuilder) writeValue(buf []byte, value slog.Value) []byte {
 func (b *jsonBuilder) appendString(buf []byte, val string) []byte {
 	buf = append(buf, '"')
 	if val == "" {
-		buf = append(buf, "!EMPTY_VALUE"...)
+		buf = append(buf, `!EMPTY_VALUE`...)
 	} else {
 		buf = appendEscapedJSONString(buf, val)
 	}
@@ -200,21 +164,34 @@ func (b *jsonBuilder) appendString(buf []byte, val string) []byte {
 }
 
 func (b *jsonBuilder) precomputeAttrs(buf []byte, _ string, attrs []slog.Attr) []byte {
-	var attrsCount = len(attrs) - 1
-
-	for i, attr := range attrs {
-		buf = b.appendAttr(buf, nil, attr)
-
-		if attrsCount != i {
-			buf = append(buf, ',')
-		}
+	for _, attr := range attrs {
+		buf = b.appendAttr(buf, attr)
 	}
-
 	return buf
 }
 
-func (b *jsonBuilder) groupPrefix(oldPrefix string, newPrefix string) string {
-	return oldPrefix + `"` + newPrefix + `":{`
+func (b *jsonBuilder) groupPrefix(oldPrefix []byte, newPrefix string) []byte {
+	oldPrefix = slices.Grow(oldPrefix, len(newPrefix)+5)
+
+	oldPrefix = b.addComma(oldPrefix)
+
+	oldPrefix = append(oldPrefix, '"')
+	oldPrefix = append(
+		oldPrefix,
+		newPrefix...) // dangerous because it does not track whether there are invalid JSON characters in the line
+	oldPrefix = append(oldPrefix, `":{`...)
+
+	return oldPrefix
+}
+
+func (b *jsonBuilder) addComma(buf []byte) []byte {
+	if len(buf) > 0 {
+		var last = buf[len(buf)-1]
+		if last != '{' && last != ',' && last != '[' {
+			buf = append(buf, ',')
+		}
+	}
+	return buf
 }
 
 // From stdlib.

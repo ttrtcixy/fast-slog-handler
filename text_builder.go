@@ -45,11 +45,11 @@ func NewTextHandler(w io.Writer, cfg *Config) *Handler {
 		cfg = &Config{Level: 0, BufferedOutput: false}
 	}
 
-	textBuilder := &colorizedTextBuilder{
+	_ = &colorizedTextBuilder{
 		//colorOpts: newColorOptions(faint, faint),
 	}
 
-	handler := newHandler(w, slog.Level(cfg.Level), textBuilder)
+	handler := newHandler(w, slog.Level(cfg.Level), nil)
 
 	if cfg.BufferedOutput {
 		handler.shared.bw = bufio.NewWriterSize(w, writerBufSize)
