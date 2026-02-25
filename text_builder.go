@@ -1,27 +1,16 @@
 package logger
 
 import (
-	"bufio"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
-	"os"
+	"slices"
 	"strconv"
 	"time"
 	"unicode"
 	"unicode/utf8"
 )
-
-//var (
-//	reset   = []byte("\033[0m")
-//	red     = []byte("\033[31m")
-//	green   = []byte("\033[32m")
-//	yellow  = []byte("\033[33m")
-//	blue    = []byte("\033[34m")
-//	magenta = []byte("\033[35m")
-//	cyan    = []byte("\033[36m")
-//	none    = []byte("")
-//)
 
 const (
 	reset  = "\u001b[0m"
@@ -33,40 +22,15 @@ const (
 )
 
 type colorizedTextBuilder struct {
-	//colorOpts *colorOptions
+	precomputedAttrs []byte
+	prefix           string
 }
 
-func NewTextHandler(w io.Writer, cfg *Config) *Handler {
-	if w == nil {
-		w = os.Stderr
-	}
-
-	if cfg == nil {
-		cfg = &Config{Level: 0, BufferedOutput: false}
-	}
-
-	_ = &colorizedTextBuilder{
-		//colorOpts: newColorOptions(faint, faint),
-	}
-
-	handler := newHandler(w, slog.Level(cfg.Level), nil)
-
-	if cfg.BufferedOutput {
-		handler.shared.bw = bufio.NewWriterSize(w, writerBufSize)
-		// Start a background routine to periodically flush the buffer.
-		// This ensures logs appear even during low activity periods.
-		go handler.flusher()
-	}
-
-	return handler
+func NewTextHandler(w io.Writer, cfg *Config) *Handler[colorizedTextBuilder] {
+	return newHandler[colorizedTextBuilder](w, cfg, colorizedTextBuilder{})
 }
 
-func (b *colorizedTextBuilder) buildLog(
-	buf []byte,
-	record slog.Record,
-	precomputedAttrs string,
-	groupPrefix string,
-) []byte {
+func (b colorizedTextBuilder) buildLog(ctx context.Context, buf []byte, record slog.Record) []byte {
 	// Time
 	buf = append(buf, faint...) // color
 	buf = record.Time.AppendFormat(buf, time.Stamp)
@@ -82,9 +46,19 @@ func (b *colorizedTextBuilder) buildLog(
 	// Message // todo if no message
 	buf = append(buf, record.Message...)
 
+	// Check the ctx for slog.Args
+	// !Important, attributes from the context are not saved, but are collected every time the log is output
+	if ctx != nil {
+		if val, ok := ctx.Value(attrsKey).([]slog.Attr); ok {
+			for _, attr := range val {
+				buf = b.appendAttr(buf, nil, attr)
+			}
+		}
+	}
+
 	// Append precomputed attributes (from WithAttrs)
-	if len(precomputedAttrs) > 0 {
-		buf = append(buf, precomputedAttrs...)
+	if len(b.precomputedAttrs) > 0 {
+		buf = append(buf, b.precomputedAttrs...)
 	}
 	// Process dynamic attributes (attached to this specific record)
 	if record.NumAttrs() > 0 {
@@ -93,8 +67,8 @@ func (b *colorizedTextBuilder) buildLog(
 		pref := groupBuf[:0]
 
 		// Add group from WithGroup()
-		if len(groupPrefix) > 0 {
-			pref = append(pref, groupPrefix...)
+		if len(b.prefix) > 0 {
+			pref = append(pref, b.prefix...)
 		}
 
 		record.Attrs(func(attr slog.Attr) bool {
@@ -111,7 +85,7 @@ func (b *colorizedTextBuilder) buildLog(
 	return buf
 }
 
-func (b *colorizedTextBuilder) appendAttr(buf []byte, groupPrefix []byte, attr slog.Attr) []byte {
+func (b colorizedTextBuilder) appendAttr(buf []byte, groupPrefix []byte, attr slog.Attr) []byte {
 	attr.Value = attr.Value.Resolve()
 
 	if attr.Equal(slog.Attr{}) {
@@ -150,7 +124,7 @@ func (b *colorizedTextBuilder) appendAttr(buf []byte, groupPrefix []byte, attr s
 	return buf
 }
 
-func (b *colorizedTextBuilder) writeValue(buf []byte, value slog.Value) []byte {
+func (b colorizedTextBuilder) writeValue(buf []byte, value slog.Value) []byte {
 	switch value.Kind() {
 	case slog.KindString:
 		buf = b.appendString(buf, value.String())
@@ -171,11 +145,11 @@ func (b *colorizedTextBuilder) writeValue(buf []byte, value slog.Value) []byte {
 	case slog.KindTime:
 		buf = value.Time().AppendFormat(buf, time.DateTime)
 	case slog.KindAny:
-		b, err := json.Marshal(value.Any())
+		val, err := json.Marshal(value.Any())
 		if err != nil {
 			buf = append(buf, "!ERR_MARSHAL"...)
 		} else {
-			buf = append(buf, b...)
+			buf = append(buf, val...)
 		}
 	default:
 		buf = append(buf, "!UNHANDLED"...)
@@ -183,28 +157,33 @@ func (b *colorizedTextBuilder) writeValue(buf []byte, value slog.Value) []byte {
 	return buf
 }
 
-func (b *colorizedTextBuilder) precomputeAttrs(buf []byte, groupPrefix string, attrs []slog.Attr) []byte {
+func (b colorizedTextBuilder) precomputeAttrs(attrs []slog.Attr) colorizedTextBuilder {
+	buf := slices.Clip(b.precomputedAttrs)
+
 	// Prepare the current group prefix for these specific attributes.
 	var groupBuf [128]byte
 	pref := groupBuf[:0]
 
 	// Add group from WithGroup()
-	if len(groupPrefix) > 0 {
-		pref = append(pref, groupPrefix...)
+	if len(b.prefix) > 0 {
+		pref = append(pref, b.prefix...)
 	}
 
 	for _, attr := range attrs {
 		buf = b.appendAttr(buf, pref, attr)
 	}
 
-	return buf
+	return colorizedTextBuilder{
+		precomputedAttrs: buf,
+		prefix:           b.prefix,
+	}
 }
 
-func (b *colorizedTextBuilder) groupPrefix(oldPrefix string, newPrefix string) string {
-	return oldPrefix + newPrefix + "."
+func (b colorizedTextBuilder) groupPrefix(newPrefix string) colorizedTextBuilder {
+	return colorizedTextBuilder{precomputedAttrs: b.precomputedAttrs, prefix: b.prefix + newPrefix + "."}
 }
 
-func (b *colorizedTextBuilder) appendString(buf []byte, val string) []byte {
+func (b colorizedTextBuilder) appendString(buf []byte, val string) []byte {
 	if val == "" {
 		buf = append(buf, "!EMPTY_VALUE"...)
 	} else {
@@ -217,10 +196,12 @@ func (b *colorizedTextBuilder) appendString(buf []byte, val string) []byte {
 	return buf
 }
 
+// From stdlib.
+
 func needsQuoting(s string) bool {
-	if len(s) == 0 {
-		return true
-	}
+	//if len(s) == 0 {
+	//	return true
+	//}
 	for i := 0; i < len(s); {
 		b := s[i]
 		if b < utf8.RuneSelf {

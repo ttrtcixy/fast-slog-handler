@@ -1,6 +1,7 @@
 package logger
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -11,17 +12,17 @@ import (
 )
 
 type jsonBuilder struct {
-	// precomputed for jsonBuilder stores already formatted args from WithAttrs() and WithGroup()
+	// precomputed for jsonBuilder stores already formatted args from WithAttrs() and WithGroup().
 	precomputed []byte
-	//
+	// the depth increases each time a group is added using groupPrefix.
 	depth int
 }
 
-func NewJsonHandler(w io.Writer, cfg *Config) *Handler {
-	return newHandler(w, cfg, &jsonBuilder{})
+func NewJsonHandler(w io.Writer, cfg *Config) *Handler[jsonBuilder] {
+	return newHandler[jsonBuilder](w, cfg, jsonBuilder{})
 }
 
-func (b *jsonBuilder) buildLog(buf []byte, record slog.Record, precomputed []byte, depth int) []byte {
+func (b jsonBuilder) buildLog(ctx context.Context, buf []byte, record slog.Record) []byte {
 	buf = append(buf, `{"time":"`...)
 	buf = record.Time.AppendFormat(buf, time.DateTime)
 
@@ -38,9 +39,20 @@ func (b *jsonBuilder) buildLog(buf []byte, record slog.Record, precomputed []byt
 	}
 	buf = append(buf, '"')
 
-	if len(precomputed) > 0 {
+	// Check the ctx for slog.Args
+	// !Important, attributes from the context are not saved, but are collected every time the log is output
+	if ctx != nil {
+		if val, ok := ctx.Value(attrsKey).([]slog.Attr); ok {
+			for _, attr := range val {
+				buf = b.addComma(buf)
+				buf = b.appendAttr(buf, attr)
+			}
+		}
+	}
+
+	if len(b.precomputed) > 0 {
 		buf = b.addComma(buf)
-		buf = append(buf, precomputed...)
+		buf = append(buf, b.precomputed...)
 	}
 
 	if record.NumAttrs() > 0 {
@@ -50,7 +62,7 @@ func (b *jsonBuilder) buildLog(buf []byte, record slog.Record, precomputed []byt
 		})
 	}
 
-	for range depth {
+	for range b.depth {
 		buf = append(buf, '}')
 	}
 
@@ -59,7 +71,7 @@ func (b *jsonBuilder) buildLog(buf []byte, record slog.Record, precomputed []byt
 	return buf
 }
 
-func (b *jsonBuilder) appendAttr(buf []byte, attr slog.Attr) []byte {
+func (b jsonBuilder) appendAttr(buf []byte, attr slog.Attr) []byte {
 	attr.Value = attr.Value.Resolve()
 
 	if attr.Equal(slog.Attr{}) {
@@ -111,7 +123,7 @@ func (b *jsonBuilder) appendAttr(buf []byte, attr slog.Attr) []byte {
 	return buf
 }
 
-func (b *jsonBuilder) writeValue(buf []byte, value slog.Value) []byte {
+func (b jsonBuilder) writeValue(buf []byte, value slog.Value) []byte {
 	switch value.Kind() {
 	case slog.KindString:
 		buf = b.appendString(buf, value.String())
@@ -138,11 +150,11 @@ func (b *jsonBuilder) writeValue(buf []byte, value slog.Value) []byte {
 			buf = b.appendString(buf, err.Error())
 			return buf
 		}
-		b, err := json.Marshal(value.Any())
+		val, err := json.Marshal(value.Any())
 		if err != nil {
 			buf = append(buf, `!ERR_MARSHAL`...)
 		} else {
-			buf = append(buf, b...)
+			buf = append(buf, val...)
 		}
 	default:
 		buf = append(buf, `!UNHANDLED`...)
@@ -151,7 +163,7 @@ func (b *jsonBuilder) writeValue(buf []byte, value slog.Value) []byte {
 	return buf
 }
 
-func (b *jsonBuilder) appendString(buf []byte, val string) []byte {
+func (b jsonBuilder) appendString(buf []byte, val string) []byte {
 	buf = append(buf, '"')
 	if val == "" {
 		buf = append(buf, `!EMPTY_VALUE`...)
@@ -163,28 +175,39 @@ func (b *jsonBuilder) appendString(buf []byte, val string) []byte {
 	return buf
 }
 
-func (b *jsonBuilder) precomputeAttrs(buf []byte, _ string, attrs []slog.Attr) []byte {
+func (b jsonBuilder) precomputeAttrs(attrs []slog.Attr) jsonBuilder {
+	buf := slices.Clip(b.precomputed)
+
 	for _, attr := range attrs {
 		buf = b.appendAttr(buf, attr)
 	}
-	return buf
+
+	return jsonBuilder{
+		precomputed: buf,
+		depth:       b.depth,
+	}
 }
 
-func (b *jsonBuilder) groupPrefix(oldPrefix []byte, newPrefix string) []byte {
-	oldPrefix = slices.Grow(oldPrefix, len(newPrefix)+5)
+func (b jsonBuilder) groupPrefix(newPrefix string) jsonBuilder {
+	buf := slices.Clip(b.precomputed)
+	buf = slices.Grow(buf, len(newPrefix)+5)
 
-	oldPrefix = b.addComma(oldPrefix)
+	buf = b.addComma(buf)
 
-	oldPrefix = append(oldPrefix, '"')
-	oldPrefix = append(
-		oldPrefix,
+	buf = append(buf, '"')
+	buf = append(
+		buf,
 		newPrefix...) // dangerous because it does not track whether there are invalid JSON characters in the line
-	oldPrefix = append(oldPrefix, `":{`...)
+	buf = append(buf, `":{`...)
+	b.depth++
 
-	return oldPrefix
+	return jsonBuilder{
+		precomputed: buf,
+		depth:       b.depth,
+	}
 }
 
-func (b *jsonBuilder) addComma(buf []byte) []byte {
+func (b jsonBuilder) addComma(buf []byte) []byte {
 	if len(buf) > 0 {
 		var last = buf[len(buf)-1]
 		if last != '{' && last != ',' && last != '[' {

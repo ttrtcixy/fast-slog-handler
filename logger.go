@@ -7,7 +7,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,11 +21,6 @@ const (
 	basePoolBufferSize = 2048
 	// waiting time for the automatic Flush() call
 	flushTime = time.Millisecond * 250
-)
-
-var (
-	poolBaseSize = basePoolBufferSize
-	poolMaxSize  = maxPoolBufSize
 )
 
 const (
@@ -45,7 +39,7 @@ var (
 var bufPool = sync.Pool{
 	New: func() any {
 		// Use a pointer to slice to avoid allocation when putting back to pool
-		b := make([]byte, 0, poolBaseSize)
+		b := make([]byte, 0, basePoolBufferSize)
 		return &b
 	},
 }
@@ -59,8 +53,8 @@ type Config struct {
 	WriteBuffSize int
 	// if BufferedOutput == true, you can specify the time after which the buffer will be cleared automatically, if FlushInterval == 0 clearing will occur every 250ms.
 	FlushInterval time.Duration
-	// buffer size stored in the pool, default - 2048.
-	BaseBufPoolSize int
+	//// buffer size stored in the pool, default - 2048.
+	//BaseBufPoolSize int
 	// the maximum size to which the buffer in the pool can be expanded; after exceeding this size, the buffer is cleared by the garbage collector, default - 4096.
 	MaxBufPoolSize int
 }
@@ -81,34 +75,29 @@ type shared struct {
 	closed atomic.Bool
 }
 
-type builder interface {
-	buildLog(buf []byte, record slog.Record, precomputed []byte, depth int) []byte
-	precomputeAttrs(buf []byte, groupPrefix string, attrs []slog.Attr) []byte
-	groupPrefix(oldPrefix []byte, newPrefix string) []byte
+type builderConstraint[B any] interface {
+	jsonBuilder | colorizedTextBuilder
+	buildLog(ctx context.Context, buf []byte, record slog.Record) []byte
+	precomputeAttrs(attrs []slog.Attr) B
+	groupPrefix(newPrefix string) B
 }
 
-type Handler struct {
+type Handler[B builderConstraint[B]] struct {
 	// holds the state common to all clones of the handler (writer, mutex, flags).
 	shared *shared
 
 	level slog.Level
 
 	// builder implements the log formatting logic (text, json, etc.) abstracting it from the handler control flow.
-	builder builder
+	builder B
 
-	//// groupPrefix stores the accumulated group name (e.g., "http.server.")
-	//// to flatten nested groups into dot-notation keys.
-	//groupPrefix string
-	//
-	//// precomputed for jsonBuilder stores already formatted args from WithAttrs() and WithGroup()
-	//precomputed []byte
-	////
-	//depth int
+	// max pool buf size
+	maxBufPoolSize int
 }
 
 // Close signals the flusher to stop, marks the handler as closed using an atomic flag and flush buffer.
 // Closes buffered output only.
-func (h *Handler) Close(_ context.Context) error {
+func (h *Handler[B]) Close(_ context.Context) error {
 	// If buffering was never create.
 	if h.shared.bw == nil {
 		return ErrNothingToClose
@@ -128,14 +117,13 @@ func (h *Handler) Close(_ context.Context) error {
 
 // flusher periodically flushes the buffer to the writer.
 // It stops when the done channel is closed.
-func (h *Handler) flusher(cfgFlushInterval time.Duration) {
+func (h *Handler[B]) flusher(cfgFlushInterval time.Duration) {
 	var ticker *time.Ticker
 
 	if cfgFlushInterval <= 0 {
-		ticker = time.NewTicker(cfgFlushInterval)
-	} else {
 		ticker = time.NewTicker(flushTime)
-
+	} else {
+		ticker = time.NewTicker(cfgFlushInterval)
 	}
 
 	defer ticker.Stop()
@@ -151,13 +139,13 @@ func (h *Handler) flusher(cfgFlushInterval time.Duration) {
 }
 
 // flushBuffer writes any buffered data to the underlying writer.
-func (h *Handler) flushBuffer() {
+func (h *Handler[B]) flushBuffer() {
 	h.shared.mu.Lock()
 	_ = h.shared.bw.Flush()
 	h.shared.mu.Unlock()
 }
 
-func newHandler(w io.Writer, cfg *Config, builder builder) *Handler {
+func newHandler[B builderConstraint[B]](w io.Writer, cfg *Config, builder B) *Handler[B] {
 	if w == nil {
 		w = os.Stderr
 	}
@@ -173,18 +161,15 @@ func newHandler(w io.Writer, cfg *Config, builder builder) *Handler {
 		closed: atomic.Bool{},
 	}
 
-	handler := &Handler{
-		shared:  shared,
-		level:   cfg.Level,
-		builder: builder,
-	}
-
-	if cfg.BaseBufPoolSize > 0 {
-		poolBaseSize = cfg.BaseBufPoolSize
+	handler := &Handler[B]{
+		shared:         shared,
+		level:          cfg.Level,
+		builder:        builder,
+		maxBufPoolSize: maxPoolBufSize,
 	}
 
 	if cfg.MaxBufPoolSize > 0 {
-		poolMaxSize = cfg.MaxBufPoolSize
+		handler.maxBufPoolSize = cfg.MaxBufPoolSize
 	}
 
 	if cfg.BufferedOutput {
@@ -201,23 +186,16 @@ func newHandler(w io.Writer, cfg *Config, builder builder) *Handler {
 	return handler
 }
 
-func (h *Handler) Enabled(_ context.Context, level slog.Level) bool {
+func (h *Handler[B]) Enabled(_ context.Context, level slog.Level) bool {
 	if h.shared.closed.Load() {
 		return false
 	}
 	return level >= h.level
 }
 
-func (h *Handler) Handle(ctx context.Context, record slog.Record) (err error) {
+func (h *Handler[B]) Handle(ctx context.Context, record slog.Record) (err error) {
 	if h.shared.closed.Load() {
 		return nil
-	}
-
-	// Check the ctx for slog.Args
-	if ctx != nil {
-		if val, ok := ctx.Value(attrsKey).([]slog.Attr); ok {
-			record.AddAttrs(val...)
-		}
 	}
 
 	// Acquire a buffer from the pool to minimize garbage collection pressure.
@@ -225,7 +203,7 @@ func (h *Handler) Handle(ctx context.Context, record slog.Record) (err error) {
 	// Reset buffer length but keep capacity.
 	buf := (*pBuf)[:0]
 
-	buf = h.builder.buildLog(buf, record, h.precomputed, h.depth)
+	buf = h.builder.buildLog(ctx, buf, record)
 
 	if !h.shared.closed.Load() {
 		h.shared.mu.Lock()
@@ -239,7 +217,7 @@ func (h *Handler) Handle(ctx context.Context, record slog.Record) (err error) {
 
 	// Return buffer to pool only if it hasn't grown too large.
 	// This prevents one huge handler message from permanently keeping a large chunk of memory.
-	if cap(buf) <= poolMaxSize {
+	if cap(buf) <= h.maxBufPoolSize {
 		*pBuf = buf
 		bufPool.Put(pBuf)
 	}
@@ -248,41 +226,37 @@ func (h *Handler) Handle(ctx context.Context, record slog.Record) (err error) {
 }
 
 // WithGroup  returns a new slog.Handler that adds the passed group to all attrs.
-func (h *Handler) WithGroup(name string) slog.Handler {
+func (h *Handler[B]) WithGroup(name string) slog.Handler {
 	if name == "" {
 		return h
 	}
 
 	h2 := h.clone()
-
-	h2.precomputed = h2.builder.groupPrefix(h2.precomputed, name) // alloc
-	h2.depth++
+	h2.builder = h.builder.groupPrefix(name)
 
 	return h2
 }
 
 // WithAttrs returns a new slog.Handler with the given attributes appended.
-func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
+func (h *Handler[B]) WithAttrs(attrs []slog.Attr) slog.Handler {
 	if len(attrs) == 0 {
 		return h
 	}
 
 	h2 := h.clone()
 
-	h2.precomputed = h.builder.precomputeAttrs(h2.precomputed, h.groupPrefix, attrs)
+	h2.builder = h.builder.precomputeAttrs(attrs)
 
 	return h2
 }
 
 // clone create new Handler with common state, groupPrefix and precomputed data.
-func (h *Handler) clone() *Handler {
-	return &Handler{
-		shared:      h.shared,
-		level:       h.level,
-		builder:     h.builder,
-		groupPrefix: h.groupPrefix,
-		precomputed: slices.Clip(h.precomputed),
-		depth:       h.depth,
+func (h *Handler[B]) clone() *Handler[B] {
+	return &Handler[B]{
+		shared:         h.shared,
+		level:          h.level,
+		builder:        h.builder,
+		maxBufPoolSize: h.maxBufPoolSize,
 	}
 }
 
@@ -291,9 +265,13 @@ type loggerCtxKey struct {
 
 var attrsKey = loggerCtxKey{}
 
+func (h *Handler[builderT]) AppendAttrsToCtx(ctx context.Context, attrs ...slog.Attr) context.Context {
+	return AppendAttrsToCtx(ctx, attrs...)
+}
+
 // AppendAttrsToCtx add []slog.Attr to ctx with attrsKey, if the ctx already contains arguments, add them to the existing ones.
 // Attributes will be added at the beginning, outside of groups created using WithGroup.
-func (h *Handler) AppendAttrsToCtx(ctx context.Context, attrs ...slog.Attr) context.Context {
+func AppendAttrsToCtx(ctx context.Context, attrs ...slog.Attr) context.Context {
 	if len(attrs) == 0 {
 		return ctx
 	}
@@ -307,64 +285,3 @@ func (h *Handler) AppendAttrsToCtx(ctx context.Context, attrs ...slog.Attr) cont
 
 	return context.WithValue(ctx, attrsKey, attrs)
 }
-
-//func (h *ColorizedHandler) WithGroup(name string) slog.handler {
-//	if name == "" {
-//		return h
-//	}
-//
-//	h2 := h.clone()
-//
-//	// Pre-allocate to avoid multiple re-allocations during append
-//	h2.groupPrefix = slices.Grow(h2.groupPrefix, len(name)+1)
-//
-//	h2.groupPrefix = append(h2.groupPrefix, name...)
-//	h2.groupPrefix = append(h2.groupPrefix, '.')
-//
-//	return h2
-//}
-
-//func (h *ColorizedHandler) WithAttrs(attrs []slog.Attr) slog.handler {
-//	if len(attrs) == 0 {
-//		return h
-//	}
-//	h2 := h.clone()
-//
-//	// Calculate estimated size more precisely to reduce allocations
-//	var estimatedSize int
-//	for _, v := range attrs {
-//		estimatedSize += len(v.Key) + 64
-//	}
-//
-//	h2.precomputed = slices.Grow(h2.precomputed, estimatedSize)
-//
-//	// stack allocated buffer for group prefix
-//	var groupBuf [128]byte
-//	pref := groupBuf[:0]
-//
-//	//  add groupPrefix for attrs
-//	if len(h2.groupPrefix) > 0 {
-//		pref = append(pref, h2.groupPrefix...)
-//	}
-//
-//	//pref := h2.groupPrefix
-//	for _, attr := range attrs {
-//		h2.precomputed = h.appendAttr(h2.precomputed, pref, attr)
-//	}
-//
-//	return h2
-//}
-
-//func (h *ColorizedHandler) clone() *ColorizedHandler {
-//	return &ColorizedHandler{
-//		colorOpts: h.colorOpts,
-//		mu:        h.mu,
-//		w:         h.w,
-//		level:     h.level,
-//		// slices.Clip is CRITICAL here. It removes unused capacity.
-//		// This forces the next 'append' in the child (h2) to allocate a NEW array,
-//		// preventing it from overwriting the parent's (h) future data if they shared the same backing array.
-//		groupPrefix: slices.Clip(h.groupPrefix),
-//		precomputed: slices.Clip(h.precomputed),
-//	}
-//}
