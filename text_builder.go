@@ -187,11 +187,11 @@ func (b colorizedTextBuilder) appendString(buf []byte, val string) []byte {
 	if val == "" {
 		buf = append(buf, "!EMPTY_VALUE"...)
 	} else {
-		if needsQuoting(val) {
-			buf = strconv.AppendQuote(buf, val)
-		} else {
-			buf = append(buf, val...)
-		}
+		//if needsQuoting(val) {
+		//	buf = strconv.AppendQuote(buf, val)
+		//} else {
+		buf = append(buf, val...)
+		//}
 	}
 	return buf
 }
